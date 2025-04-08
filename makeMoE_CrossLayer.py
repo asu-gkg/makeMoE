@@ -18,6 +18,7 @@ n_layer = 8
 dropout = 0.1
 num_experts = 8 # This can be adjusted depending on the overall number of parameters
 top_k = 2 # This controls the number of active parameters
+skip_prob_threshold = 0.5  # 跳过当前层的概率阈值
 
 torch.manual_seed(1337)
 
@@ -102,6 +103,7 @@ class MultiHeadAttention(nn.Module):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.dropout(self.proj(out))
         return out
+
 #Expert module
 class Expert(nn.Module):
     """ An MLP is a simple linear layer followed by a non-linearity i.e. each Expert """
@@ -118,116 +120,165 @@ class Expert(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-#noisy top-k gating
-class NoisyTopkRouter(nn.Module):
+# Cross-layer Router - Can decide whether to use current layer experts or skip to next layer
+class CrossLayerRouter(nn.Module):
     def __init__(self, n_embed, num_experts, top_k):
-        super(NoisyTopkRouter, self).__init__()
+        super(CrossLayerRouter, self).__init__()
         self.top_k = top_k
-        #layer for router logits
-        self.topkroute_linear = nn.Linear(n_embed, num_experts)
-        self.noise_linear =nn.Linear(n_embed, num_experts)
-
-    def forward(self, mh_output):
-        # mh_ouput is the output tensor from multihead self attention block
-        logits = self.topkroute_linear(mh_output)
-
-        #Noise logits
-        noise_logits = self.noise_linear(mh_output)
-
-        #Adding scaled unit gaussian noise to the logits
-        noise = torch.randn_like(logits)*F.softplus(noise_logits)
+        # Expert selection router
+        self.expert_router = nn.Linear(n_embed, num_experts)
+        self.noise_linear = nn.Linear(n_embed, num_experts)
+        
+        # Skip decision network - Decides whether to skip current layer
+        self.skip_router = nn.Linear(n_embed, 1)
+        
+    def forward(self, x):
+        # Expert selection routing
+        logits = self.expert_router(x)
+        
+        # Add noise
+        noise_logits = self.noise_linear(x)
+        noise = torch.randn_like(logits) * F.softplus(noise_logits)
         noisy_logits = logits + noise
-
+        
+        # Select top-k experts
         top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
         zeros = torch.full_like(noisy_logits, float('-inf'))
         sparse_logits = zeros.scatter(-1, indices, top_k_logits)
         router_output = F.softmax(sparse_logits, dim=-1)
-        return router_output, indices
+        
+        # Skip decision - Output skip probability
+        skip_logits = self.skip_router(x)
+        skip_prob = torch.sigmoid(skip_logits)
+        
+        return router_output, indices, skip_prob
 
-#Now create the sparse mixture of experts module
-
-
-class SparseMoE(nn.Module):
+# Cross-layer Sparse Mixture of Experts Module
+class CrossLayerSparseMoE(nn.Module):
     def __init__(self, n_embed, num_experts, top_k, capacity_factor=1.0):
-        super(SparseMoE, self).__init__()
-        self.router = NoisyTopkRouter(n_embed, num_experts, top_k)
+        super(CrossLayerSparseMoE, self).__init__()
+        self.router = CrossLayerRouter(n_embed, num_experts, top_k)
         self.experts = nn.ModuleList([Expert(n_embed) for _ in range(num_experts)])
         self.top_k = top_k
         self.capacity_factor = capacity_factor
         self.num_experts = num_experts
     
-    def forward(self, x):
-    # Assuming x has shape [batch_size, seq_len, n_embd]
+    def forward(self, x, return_skip_info=False):
+        # Assuming x has shape [batch_size, seq_len, n_embd]
         batch_size, seq_len, _ = x.shape
-        gating_output, indices = self.router(x)
-        final_output = torch.zeros_like(x)
-
-        # Flatten the batch and sequence dimensions to treat each token independently
-        flat_x = x.view(-1, x.size(-1))  
-        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
-
-        tokens_per_batch = batch_size * seq_len * self.top_k
-        expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
-
-        updates = torch.zeros_like(flat_x)
-
-        for i, expert in enumerate(self.experts):
-            expert_mask = (indices == i).any(dim=-1)
-            flat_mask = expert_mask.view(-1)
-            selected_indices = torch.nonzero(flat_mask).squeeze(-1)
-            limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
-            if limited_indices.numel() > 0:
-                expert_input = flat_x[limited_indices]
-                expert_output = expert(expert_input)
-                gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
-                weighted_output = expert_output * gating_scores
-                updates.index_add_(0, limited_indices, weighted_output)
-
-        # Reshape updates to match the original dimensions of x
-        final_output += updates.view(batch_size, seq_len, -1)
-
+        gating_output, indices, skip_prob = self.router(x)
+        
+        # Determine which inputs should skip the current layer
+        # Skip if skip probability > threshold
+        skip_decision = (skip_prob > skip_prob_threshold).squeeze(-1)  # [batch_size, seq_len]
+        
+        # Create output tensor, initialized as input (for skipped tokens, keep unchanged)
+        final_output = x.clone()
+        
+        # Only process non-skipped inputs
+        non_skip_mask = ~skip_decision
+        if non_skip_mask.any():
+            # Extract non-skipped inputs
+            non_skip_x = x[non_skip_mask]
+            non_skip_gating = gating_output[non_skip_mask]
+            non_skip_indices = indices[non_skip_mask]
+            
+            # Process non-skipped inputs
+            # Flatten processing
+            flat_x = non_skip_x.view(-1, x.size(-1))
+            flat_gating_output = non_skip_gating.view(-1, gating_output.size(-1))
+            flat_indices = non_skip_indices.view(-1, indices.size(-1))
+            
+            tokens_per_batch = flat_x.size(0) * self.top_k
+            expert_capacity = int((tokens_per_batch / self.num_experts) * self.capacity_factor)
+            
+            updates = torch.zeros_like(flat_x)
+            
+            for i, expert in enumerate(self.experts):
+                expert_mask = (flat_indices == i).any(dim=-1)
+                selected_indices = torch.nonzero(expert_mask).squeeze(-1)
+                limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
+                
+                if limited_indices.numel() > 0:
+                    expert_input = flat_x[limited_indices]
+                    expert_output = expert(expert_input)
+                    gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
+                    weighted_output = expert_output * gating_scores
+                    updates.index_add_(0, limited_indices, weighted_output)
+            
+            # Put processed results back into final output
+            non_skip_output = updates.view(non_skip_x.size())
+            final_output[non_skip_mask] = non_skip_output
+        
+        if return_skip_info:
+            return final_output, skip_decision
         return final_output
-      
-#First create a self attention + mixture of experts block, that may be repeated several number of times
-#Copy pasting key architecture variables for clarity
 
-class Block(nn.Module):
-    """ Mixture of Experts Transformer block: communication followed by computation (multi-head self attention + SparseMoE) """
+# 跨层Block
+class CrossLayerBlock(nn.Module):
+    """ 跨层Block: 可以跳过当前层的专家计算 """
 
     def __init__(self, n_embed, n_head, num_experts, top_k):
-        # n_embed: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
         head_size = n_embed // n_head
         self.sa = MultiHeadAttention(n_head, head_size)
-        self.smoe = SparseMoE(n_embed, num_experts, top_k)
+        self.smoe = CrossLayerSparseMoE(n_embed, num_experts, top_k)
         self.ln1 = nn.LayerNorm(n_embed)
         self.ln2 = nn.LayerNorm(n_embed)
 
-    def forward(self, x):
+    def forward(self, x, return_skip_info=False):
+        # 注意力层总是执行
         x = x + self.sa(self.ln1(x))
-        x = x + self.smoe(self.ln2(x))
-        return x
-      
-#Finally putting it all together to crease a sparse mixture of experts language model
-class SparseMoELanguageModel(nn.Module):
+        
+        # MoE层可能被跳过
+        if return_skip_info:
+            moe_output, skip_info = self.smoe(self.ln2(x), return_skip_info=True)
+            x = x + moe_output
+            return x, skip_info
+        else:
+            x = x + self.smoe(self.ln2(x))
+            return x
 
+# 跨层语言模型
+class CrossLayerMoELanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed)
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.blocks = nn.Sequential(*[Block(n_embed, n_head=n_head, num_experts=num_experts,top_k=top_k) for _ in range(n_layer)])
+        
+        # 使用ModuleList而不是Sequential，以便我们可以跟踪跳过信息
+        self.blocks = nn.ModuleList([
+            CrossLayerBlock(n_embed, n_head=n_head, num_experts=num_experts, top_k=top_k) 
+            for _ in range(n_layer)
+        ])
+        
         self.ln_f = nn.LayerNorm(n_embed) # final layer norm
         self.lm_head = nn.Linear(n_embed, vocab_size)
+        
+        # 用于跟踪跳过统计信息
+        self.register_buffer('layer_skip_counts', torch.zeros(n_layer))
+        self.register_buffer('total_token_counts', torch.zeros(n_layer))
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, collect_skip_stats=False):
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
-        x = self.blocks(x) # (B,T,C)
+        
+        # 处理每一层，可能跳过某些层的专家
+        if collect_skip_stats:
+            for i, block in enumerate(self.blocks):
+                x, skip_info = block(x, return_skip_info=True)
+                # 更新跳过统计信息
+                self.layer_skip_counts[i] += skip_info.sum().item()
+                self.total_token_counts[i] += skip_info.numel()
+        else:
+            for block in self.blocks:
+                x = block(x)
+        
         x = self.ln_f(x) # (B,T,C)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
@@ -240,6 +291,17 @@ class SparseMoELanguageModel(nn.Module):
             loss = F.cross_entropy(logits, targets)
 
         return logits, loss
+    
+    def get_skip_stats(self):
+        """返回每层的跳过率统计信息"""
+        if self.total_token_counts.sum() == 0:
+            return torch.zeros_like(self.layer_skip_counts)
+        return self.layer_skip_counts / self.total_token_counts
+
+    def reset_skip_stats(self):
+        """重置跳过统计信息"""
+        self.layer_skip_counts.zero_()
+        self.total_token_counts.zero_()
 
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
@@ -257,42 +319,49 @@ class SparseMoELanguageModel(nn.Module):
             # append sampled index to the running sequence
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
-      
 
 def kaiming_init_weights(m):
-    if isinstance (m, (nn.Linear)):
+    if isinstance(m, (nn.Linear)):
         init.kaiming_normal_(m.weight)
 
 def main():
-    model = SparseMoELanguageModel()
+    model = CrossLayerMoELanguageModel()
     model.apply(kaiming_init_weights)
     model = model.to(device)
 
     print(sum(p.numel() for p in model.parameters()) / 1e6, 'M parameters')
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-    m = model.to(device)
-    # print the number of parameters in the model
-    print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
-
-    # create a PyTorch optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
     for iter in range(max_iters):
-
-        # every once in a while evaluate the loss on train and val sets
+        # 每隔一段时间评估损失并收集跳过统计信息
         if iter % eval_interval == 0 or iter == max_iters - 1:
+            # 重置跳过统计信息
+            model.reset_skip_stats()
+            
+            # 收集一批数据的跳过统计信息
+            xb, yb = get_batch('train')
+            _, _ = model(xb, yb, collect_skip_stats=True)
+            
+            # 获取跳过率
+            skip_rates = model.get_skip_stats()
+            
+            # 评估损失
             losses = estimate_loss(model)
             print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            print(f"Layer skip rates: {skip_rates}")
 
-        # sample a batch of data
+        # 采样一批数据
         xb, yb = get_batch('train')
 
-        # evaluate the loss
+        # 评估损失
         logits, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+    
+    # 生成示例文本
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    print(decode(model.generate(context, max_new_tokens=500)[0].tolist()))
 
 if __name__ == "__main__":
-    main()
+    main() 

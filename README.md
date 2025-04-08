@@ -49,3 +49,8 @@ makeMoE_Concise.ipynb is the consolidated hackable implementation that I encoura
 **Please note that the implementation emphasizes readability and hackability vs. performance, so there are many ways in which you could improve this. Please try and let me know!**
 
 Hope you find this useful. Happy hacking!!
+
+
+# debug
+
+python -m debugpy --listen 0.0.0.0:5678 --wait-for-client InternLM_HF_demo.py
